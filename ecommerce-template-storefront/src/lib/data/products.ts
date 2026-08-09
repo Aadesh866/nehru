@@ -45,6 +45,42 @@ export const listProducts = async ({
     }
   }
 
+  const { headers: nextHeaders } = await import("next/headers")
+  const headersList = await nextHeaders()
+  const domain = headersList.get("host") || "localhost:8000"
+  const { getStoreConfig } = await import("@lib/store-factory")
+  const store = await getStoreConfig(domain)
+
+  const customQueryParams = { ...queryParams }
+  if (store?.medusa_sales_channel_id) {
+    customQueryParams.sales_channel_id = store.medusa_sales_channel_id
+  }
+
+  const payloadUrl = process.env.NEXT_PUBLIC_PAYLOAD_SERVER_URL || "http://localhost:3000"
+
+  // SLUG RESOLVER: If querying by handle, check if it's a Payload override first
+  if (customQueryParams.handle && store) {
+    try {
+      const res = await fetch(
+        `${payloadUrl}/api/product-websites?where[website][equals]=${store.id}&where[slug_override][equals]=${customQueryParams.handle}&limit=1`,
+        { next: { tags: ["product_websites"] }, cache: "force-cache" }
+      )
+      if (res.ok) {
+        const payloadData = await res.json()
+        if (payloadData.docs && payloadData.docs.length > 0) {
+          const override = payloadData.docs[0]
+          if (override.product?.medusa_id) {
+            // Swap handle for id
+            delete customQueryParams.handle
+            customQueryParams.id = override.product.medusa_id
+          }
+        }
+      }
+    } catch (e) {
+      console.error("Failed to resolve payload slug:", e)
+    }
+  }
+
   const headers = {
     ...(await getAuthHeaders()),
   }
@@ -64,23 +100,70 @@ export const listProducts = async ({
           region_id: region?.id,
           fields:
             "*variants.calculated_price,+variants.inventory_quantity,+metadata,+tags,*payload_product",
-          ...queryParams,
+          ...customQueryParams,
         },
         headers,
         next,
         cache: "force-cache",
       }
     )
-    .then(({ products, count }) => {
+    .then(async ({ products, count }) => {
+      let mergedProducts = products
+
+      if (store && products.length > 0) {
+        const payloadUrl = process.env.NEXT_PUBLIC_PAYLOAD_SERVER_URL || "http://localhost:3000"
+        try {
+          const productIds = products.map((p) => p.id).join(",")
+          const res = await fetch(
+            `${payloadUrl}/api/product-websites?where[website][equals]=${store.id}&where[product.medusa_id][in]=${productIds}&limit=100`,
+            { next: { tags: ["product_websites"] }, cache: "force-cache" }
+          )
+          
+          if (res.ok) {
+            const payloadData = await res.json()
+            const overrides = payloadData.docs || []
+            
+            mergedProducts = products.map(product => {
+              const override = overrides.find((o: any) => o.product?.medusa_id === product.id)
+              if (!override) return product
+              
+              return {
+                ...product,
+                title: override.title_override || product.title,
+                description: override.description_override || product.description,
+                handle: override.slug_override || product.handle,
+                // Attach Payload specific presentation data to metadata or as new field
+                payload_override: {
+                  featured: override.featured,
+                  sort_order: override.sort_order || 0,
+                  visibility: override.visibility || 'visible',
+                  seo_title: override.seo_title,
+                  seo_description: override.seo_description
+                }
+              } as any
+            }).filter(p => p.payload_override?.visibility !== 'hidden')
+            
+            // Re-sort using sort_order
+            mergedProducts.sort((a, b) => {
+              const orderA = a.payload_override?.sort_order || 0
+              const orderB = b.payload_override?.sort_order || 0
+              return orderB - orderA // descending sort (higher sort_order first)
+            })
+          }
+        } catch (e) {
+          console.error("Failed to fetch product overrides:", e)
+        }
+      }
+
       const nextPage = count > offset + limit ? pageParam + 1 : null
 
       return {
         response: {
-          products,
+          products: mergedProducts,
           count,
         },
         nextPage: nextPage,
-        queryParams,
+        queryParams: customQueryParams,
       }
     })
 }

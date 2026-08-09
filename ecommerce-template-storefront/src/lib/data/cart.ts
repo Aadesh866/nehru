@@ -57,15 +57,26 @@ export async function getOrSetCart(countryCode: string) {
     throw new Error(`Region not found for country code: ${countryCode}`)
   }
 
-  let cart = await retrieveCart(undefined, 'id,region_id')
+  let cart = await retrieveCart(undefined, 'id,region_id,sales_channel_id')
 
   const headers = {
     ...(await getAuthHeaders()),
   }
 
+  const { headers: nextHeaders } = await import("next/headers")
+  const headersList = await nextHeaders()
+  const domain = headersList.get("host") || "localhost:8000"
+  const { getStoreConfig } = await import("@lib/store-factory")
+  const store = await getStoreConfig(domain)
+
   if (!cart) {
+    const cartData: any = { region_id: region.id }
+    if (store?.medusa_sales_channel_id) {
+      cartData.sales_channel_id = store.medusa_sales_channel_id
+    }
+
     const cartResp = await sdk.store.cart.create(
-      { region_id: region.id },
+      cartData,
       {},
       headers
     )
@@ -73,6 +84,11 @@ export async function getOrSetCart(countryCode: string) {
 
     await setCartId(cart.id)
 
+    const cartCacheTag = await getCacheTag("carts")
+    revalidateTag(cartCacheTag)
+  } else if (store?.medusa_sales_channel_id && cart.sales_channel_id !== store.medusa_sales_channel_id) {
+    // If a user switches domains and uses the same cart cookie, we should update the cart's sales channel
+    await sdk.store.cart.update(cart.id, { sales_channel_id: store.medusa_sales_channel_id } as any, {}, headers)
     const cartCacheTag = await getCacheTag("carts")
     revalidateTag(cartCacheTag)
   }
